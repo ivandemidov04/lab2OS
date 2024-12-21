@@ -18,7 +18,6 @@ static unsigned long cache_misses = 0;
 struct CacheBlock {
     char* data;
     bool is_dirty;
-    bool was_accessed;
     access_hint_t next_access_time;
 };
 
@@ -112,7 +111,6 @@ ssize_t lab2_read(const int fd, void* buf, const size_t count, access_hint_t hin
             cache_hits++;
 
             CacheBlock& found_block = cache_iterator->second;
-            found_block.was_accessed = true;
             found_block.next_access_time = hint;
             size_t available_bytes = BLOCK_SIZE - block_offset;
             const size_t bytes_from_block = std::min(bytes_to_read, available_bytes);
@@ -141,7 +139,7 @@ ssize_t lab2_read(const int fd, void* buf, const size_t count, access_hint_t hin
             if (ret < BLOCK_SIZE) {
                 std::memset(aligned_buf + ret, 0, BLOCK_SIZE - ret);
             }
-            const CacheBlock new_block = {aligned_buf, false, true};
+            const CacheBlock new_block = {aligned_buf, false, hint};
             cache_table[key] = new_block;
             cache_queue.push_back(key);
 
@@ -193,13 +191,12 @@ ssize_t lab2_write(const int fd, const void* buf, const size_t count, access_hin
             } else if (ret < BLOCK_SIZE) {
                 std::memset(aligned_buf + ret, 0, BLOCK_SIZE - ret);
             }
-            CacheBlock& block = cache_table[key] = {aligned_buf, false, true, hint};
+            CacheBlock& block = cache_table[key] = {aligned_buf, false, hint};
             cache_queue.push_back(key);
             block_ptr = &block;
         } else {
             cache_hits++;
             block_ptr = &cache_it->second;
-            block_ptr->was_accessed = true;
         }
         std::memcpy(block_ptr->data + block_offset, buffer + bytes_written, to_write);
         block_ptr->is_dirty = true;
