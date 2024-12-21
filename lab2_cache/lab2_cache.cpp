@@ -7,20 +7,25 @@
 #include <cstring>
 #include <iostream>
 #include <cerrno>
+#include <climits>
 
 #define BLOCK_SIZE 4096     // Block size in bytes
 #define MAX_CACHE_SIZE 32 // Max blocks in cache
 // 4096 * 32 = 128KB
+
+typedef long long access_hint_t;  // Абсолютное время в миллисекундах
 
 // Global counters for cache hits and misses
 static unsigned long cache_hits = 0;
 static unsigned long cache_misses = 0;
 
 struct CacheBlock {
-    char* data;           // Pointer to block data
-    bool is_dirty;        // Dirty flag (modified since read)
-    bool was_accessed;    // Reference bit for Second-Chance
+    char* data;            // Указатель на данные блока
+    bool is_dirty;         // Флаг грязного блока (изменен ли блок)
+    bool was_accessed;     // Флаг, был ли блок недавно использован
+    access_hint_t next_access_time;  // Время следующего доступа (для оптимальной эвакуации)
 };
+
 
 struct FileDescriptor {
     int fd;
@@ -36,35 +41,78 @@ std::list<CacheKey> cache_queue;            // Queue for Second-Chance
 // Helper functions
 FileDescriptor& get_file_descriptor(int fd);
 
+int lab2_advice(int fd, off_t offset, access_hint_t hint) {
+    CacheKey key = {fd, offset / BLOCK_SIZE};
+    auto it = cache_table.find(key);
+    if (it == cache_table.end()) {
+        // Если блока нет в кеше, ничего не делаем
+        return 0;
+    }
+
+    CacheBlock& block = it->second;
+    block.next_access_time = hint;  // Сохраняем время следующего доступа для этого блока
+    return 0;
+}
+
+
 /**
  * Frees a single cache block from memory.
  * Retrieves LChecks if a page has was_accessed bit, and if not,
  */
+// void free_cache_block() {
+//     while (!cache_queue.empty()) {
+//         CacheKey key = cache_queue.front();
+//         cache_queue.pop_front();
+//         CacheBlock& block = cache_table[key];
+//         if (block.was_accessed) {
+//             // Has been referenced, so reset reference bit and move to back
+//             block.was_accessed = false;
+//             cache_queue.push_back(key);
+//         } else {
+//             if (block.is_dirty) { // Save to disk if dirty before removing
+//                 const int fd = key.first;
+//                 const off_t block_id = key.second;
+//                 ssize_t ret = pwrite(fd, block.data, BLOCK_SIZE, block_id * BLOCK_SIZE);
+//                 if (ret != BLOCK_SIZE) {
+//                     perror("pwrite");
+//                 }
+//             }
+//             // Remove from cache
+//             free(block.data);
+//             cache_table.erase(key);
+//             break;
+//         }
+//     }
+// }
+
 void free_cache_block() {
-    while (!cache_queue.empty()) {
-        CacheKey key = cache_queue.front();
-        cache_queue.pop_front();
-        CacheBlock& block = cache_table[key];
-        if (block.was_accessed) {
-            // Has been referenced, so reset reference bit and move to back
-            block.was_accessed = false;
-            cache_queue.push_back(key);
-        } else {
-            if (block.is_dirty) { // Save to disk if dirty before removing
-                const int fd = key.first;
-                const off_t block_id = key.second;
-                ssize_t ret = pwrite(fd, block.data, BLOCK_SIZE, block_id * BLOCK_SIZE);
-                if (ret != BLOCK_SIZE) {
-                    perror("pwrite");
-                }
-            }
-            // Remove from cache
-            free(block.data);
-            cache_table.erase(key);
-            break;
+    CacheKey victim_key;
+    access_hint_t latest_access_time = LLONG_MIN;  // Инициализируем минимальным значением
+
+    for (auto it = cache_table.begin(); it != cache_table.end(); ++it) {
+        CacheBlock& block = it->second;
+
+        if (block.next_access_time > latest_access_time) {
+            latest_access_time = block.next_access_time;
+            victim_key = it->first;
         }
     }
+
+    // Удаляем блок с наибольшим временем следующего доступа (будущий доступ)
+    CacheBlock& victim_block = cache_table[victim_key];
+    if (victim_block.is_dirty) {
+        const int fd = victim_key.first;
+        const off_t block_id = victim_key.second;
+        ssize_t ret = pwrite(fd, victim_block.data, BLOCK_SIZE, block_id * BLOCK_SIZE);
+        if (ret != BLOCK_SIZE) {
+            perror("pwrite");
+        }
+    }
+
+    free(victim_block.data);
+    cache_table.erase(victim_key);
 }
+
 
 /**
  * Allocates an aligned buffer into memory.
@@ -144,6 +192,7 @@ ssize_t lab2_read(const int fd, void* buf, const size_t count) {
 
             CacheBlock& found_block = cache_iterator->second;
             found_block.was_accessed = true;
+            found_block.next_access_time = LLONG_MAX;  // Блок был использован, следующее обращение к нему будет позднее
             size_t available_bytes = BLOCK_SIZE - block_offset; // What's available in block
             const size_t bytes_from_block = std::min(bytes_to_read, available_bytes); // Compare what we need with what's available
             std::memcpy(buffer + bytes_read, found_block.data + block_offset, bytes_from_block);
@@ -244,13 +293,14 @@ ssize_t lab2_write(const int fd, const void* buf, const size_t count) {
                 std::memset(aligned_buf + ret, 0, BLOCK_SIZE - ret);
             }
             // Add read block to cache
-            CacheBlock& block = cache_table[key] = {aligned_buf, false, true};
+            CacheBlock& block = cache_table[key] = {aligned_buf, false, true, LLONG_MAX};
             cache_queue.push_back(key);
             block_ptr = &block;
         } else { // HIT
             cache_hits++;
             block_ptr = &cache_it->second;
             block_ptr->was_accessed = true;
+            
         }
         // Write to cache
         std::memcpy(block_ptr->data + block_offset, buffer + bytes_written, to_write);
